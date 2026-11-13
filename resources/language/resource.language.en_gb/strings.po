@@ -1268,3 +1268,23 @@ msgstr "Enable UpNext add-on integration"
 #. Unused: 33263, 33266, 33267, 33268
 #. Please use these next and remove from
 #. this list.
+
+msgctxt "#30700"
+msgid "Prefer lossless audio (TrueHD, DTS-HD MA)"
+msgstr "Prefer lossless audio (TrueHD, DTS-HD MA)"
+
+msgctxt "#30701"
+msgid "Plays the best surround track in the same language as the server's default track, instead of the default track."
+msgstr "Plays the best surround track in the same language as the server's default track, instead of the default track."
+
+msgctxt "#30702"
+msgid "Remember audio and subtitles per series"
+msgstr "Remember audio and subtitles per series"
+
+msgctxt "#30703"
+msgid "When you change audio or subtitles in an episode, the next episodes of that series start with the same choice (kept 60 days)."
+msgstr "When you change audio or subtitles in an episode, the next episodes of that series start with the same choice (kept 60 days)."
+
+msgctxt "#30704"
+msgid "Play series"
+msgstr "Play series"

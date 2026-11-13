@@ -957,7 +957,10 @@ def get_next_episodes(item_id, limit):
         if not library:
             return
 
-    max_days = settings("maxDaysInNextEpisodes")
+    try:
+        max_days = int(settings("maxDaysInNextEpisodes") or 0)
+    except (TypeError, ValueError):
+        max_days = 0
     params = {
         "sort": {"order": "descending", "method": "lastplayed"},
         "filter": {

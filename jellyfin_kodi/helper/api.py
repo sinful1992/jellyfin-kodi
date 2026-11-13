@@ -245,12 +245,7 @@ class API(object):
             protocol = path.split("://")[0]
             path = path.replace(protocol, protocol.lower())
 
-        # Loop through configured path replacements searching for a match
-        for local_path in self.path_data.keys():
-            if local_path in path:
-                path = path.replace(local_path, self.path_data[local_path])
-
-        return path
+        return replace_path(path, self.path_data)
 
     def get_user_artwork(self, user_id):
         """Get jellyfin user profile picture."""
@@ -371,3 +366,44 @@ class API(object):
             url += query or ""
 
         return url
+
+
+def _strip_separators(value):
+    return value.rstrip("/\\") if value not in ("/", "\\") else value
+
+
+def replace_path(path, replacements):
+    """Native mode: swap the server's path prefix for the one Kodi can open (#1041).
+
+    Only a prefix that ends at a path boundary counts, and the longest one wins, so
+    "/data/movies" does not rewrite "/data/movies2/x.mkv". The replacement is done
+    once (no chaining). Trailing slashes on either side don't matter. When the result
+    is a URL (nfs://, smb://), the rest of the path uses "/".
+    """
+    if not path or not replacements:
+        return path
+
+    best = None
+    for remote, local in replacements.items():
+        if not remote or local is None:
+            continue
+        prefix = _strip_separators(remote)
+        if not path.startswith(prefix):
+            continue
+        rest = path[len(prefix):]
+        if rest and rest[0] not in "/\\" and not prefix.endswith(("/", "\\")):
+            continue  # "/data/movies" vs "/data/movies2": not a boundary
+        if best is None or len(prefix) > len(best[0]):
+            best = (prefix, local, rest)
+
+    if best is None:
+        return path
+
+    prefix, local, rest = best
+    # The target decides the separator: a URL or POSIX path uses "/", a Windows path "\\".
+    sep = "\\" if "\\" in local and "://" not in local else "/"
+    local = _strip_separators(local)
+    rest = rest.replace("\\" if sep == "/" else "/", sep)
+    if rest and not rest.startswith(sep):
+        rest = sep + rest
+    return local + rest

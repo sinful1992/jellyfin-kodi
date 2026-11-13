@@ -11,11 +11,24 @@ from .objects.obj import Objects
 from .helper import translate, api, window, settings, dialog, event, JSONRPC
 from .jellyfin import Jellyfin
 from .helper import LazyLogger
+from .helper import playutils
 from .segments import SegmentChecker, SEGMENT_TYPES_MAP
 
 #################################################################################################
 
 LOG = LazyLogger(__name__)
+
+# A seek this close to the end of the file can leave Kodi's decoder waiting for frames that
+# never come, so playback freezes and the next episode never starts (#1227). A segment that
+# reaches this window is "skipped" by finishing the item instead of seeking.
+END_OF_FILE_WINDOW = 3.0
+
+# Kodi's codec names for the DTS family, as Jellyfin names them (Codec, Profile).
+KODI_CODECS = {
+    "dtshd_ma": ("dts", "DTS-HD MA"),
+    "dtshd_hra": ("dts", "DTS-HD HRA"),
+    "dca": ("dts", None),
+}
 
 #################################################################################################
 
@@ -27,6 +40,7 @@ class Player(xbmc.Player):
     skip_segments = {}
     skip_prompted = set()
     skip_dialog = None
+    _skip_to_end = False
     segment_checker = None
 
     def __init__(self):
@@ -105,6 +119,11 @@ class Player(xbmc.Player):
         window("jellyfin_play.json", items)
 
         self.set_item(current_file, item)
+        # The tracks the add-on chose (server default, series memory, lossless
+        # pick). Detecting Kodi's state below may overwrite them with whatever
+        # Kodi opened first, so keep them to apply after the start settles.
+        planned_audio = item["AudioStreamIndex"]
+        planned_subtitle = item["SubtitleStreamIndex"]
         # Detect current audio/subtitle state from Kodi player
         self.detect_audio_subs(item)
         data = {
@@ -127,12 +146,13 @@ class Player(xbmc.Player):
             LOG.warning("Failed to report session playing: %s", e)
         window("jellyfin.skip.%s.bool" % item["Id"], True)
 
-        # Immediate skip check for segments starting at 0:00
+        # Load the segments now; the segment checker thread checks them within
+        # a second. Checking here could open the Skip button for an intro at
+        # 0:00 and hold this method until the intro ends, so the audio and
+        # subtitle choice below would land mid-scene.
         if settings("mediaSegmentsEnabled.bool"):
             try:
                 self._fetch_skip_segments(item)
-                current_pos = int(self.getTime())
-                self.check_skip_segments(item, current_pos)
             except Exception:
                 pass  # Player may not be ready yet
 
@@ -140,7 +160,11 @@ class Player(xbmc.Player):
             return
 
         if item["PlayOption"] == "Addon":
-            self.set_audio_subs(item["AudioStreamIndex"], item["SubtitleStreamIndex"])
+            item["AudioStreamIndex"] = planned_audio
+            item["SubtitleStreamIndex"] = planned_subtitle
+            self.set_audio_subs(planned_audio, planned_subtitle)
+        else:
+            self.apply_native_tracks(item)
 
     def set_item(self, file, item):
         """Set playback information."""
@@ -216,6 +240,7 @@ class Player(xbmc.Player):
                 return
 
             tracks = len(self.getAvailableAudioStreams())
+            embedded = item.get("KodiEmbeddedSubtitleIndexes")
 
             if mapping:
                 for index in mapping:
@@ -225,7 +250,12 @@ class Player(xbmc.Player):
 
                         break
                 else:
-                    self.setSubtitleStream(len(mapping) + subtitle - tracks - 1)
+                    if embedded and subtitle in embedded:
+                        self.setSubtitleStream(len(mapping) + embedded.index(subtitle))
+                    else:
+                        self.setSubtitleStream(len(mapping) + subtitle - tracks - 1)
+            elif embedded and subtitle in embedded:
+                self.setSubtitleStream(embedded.index(subtitle))
             else:
                 self.setSubtitleStream(subtitle - tracks - 1)
 
@@ -267,12 +297,15 @@ class Player(xbmc.Player):
 
         mapping = item["SubsMapping"]
         tracks = len(self.getAvailableAudioStreams())
+        embedded = item.get("KodiEmbeddedSubtitleIndexes")
+        external_count = len(mapping) if mapping else 0
 
-        if mapping:
-            if str(subs) in mapping:
-                item["SubtitleStreamIndex"] = mapping[str(subs)]
-            else:
-                item["SubtitleStreamIndex"] = subs - len(mapping) + tracks + 1
+        if mapping and str(subs) in mapping:
+            item["SubtitleStreamIndex"] = mapping[str(subs)]
+        elif embedded and 0 <= subs - external_count < len(embedded):
+            item["SubtitleStreamIndex"] = embedded[subs - external_count]
+        elif mapping:
+            item["SubtitleStreamIndex"] = subs - len(mapping) + tracks + 1
         else:
             item["SubtitleStreamIndex"] = subs + tracks + 1
 
@@ -301,6 +334,10 @@ class Player(xbmc.Player):
                     return
 
                 break
+        else:
+            LOG.warning("Current episode not in its adjacent episodes.")
+
+            return
         server_address = item["Server"].auth.get_server_info(
             item["Server"].auth.server_id
         )["address"]
@@ -350,6 +387,7 @@ class Player(xbmc.Player):
         """Does not seem to work in Leia??"""
         if self.is_playing_file(self.get_playing_file()):
 
+            self.track_position()
             self.report_playback()
             LOG.info("--[ seek ]")
 
@@ -432,6 +470,193 @@ class Player(xbmc.Player):
         }
         item["Server"].jellyfin.session_progress(data)
 
+    def onAVChange(self):
+        """Kodi switched audio or subtitles: note it now, so Stop saves the pick."""
+        try:
+            current_file = self.get_playing_file()
+            if self.is_playing_file(current_file):
+                item = self.get_file_info(current_file)
+                if item.get("PlayOption") == "Native":
+                    if "NativeStart" in item:
+                        item["NativeTracks"] = self._native_current_tracks(
+                            self._kodi_streams()
+                        )
+                else:
+                    self.detect_audio_subs(item)
+        except Exception as error:
+            LOG.debug("onAVChange: %s", error)
+
+    @staticmethod
+    def _kodi_streams():
+        result = JSONRPC("Player.GetProperties").execute(
+            {
+                "playerid": 1,
+                "properties": [
+                    "audiostreams",
+                    "subtitles",
+                    "currentaudiostream",
+                    "currentsubtitle",
+                    "subtitleenabled",
+                ],
+            }
+        )
+        return (result or {}).get("result") or {}
+
+    @staticmethod
+    def _from_kodi(stream, kind):
+        """A Kodi audio/subtitle stream as a Jellyfin-style stream, so the same
+        matching and lossless rules apply in native mode."""
+        codec = (stream.get("codec") or "").lower()
+        codec, profile = KODI_CODECS.get(codec, (codec or None, None))
+        return {
+            "Index": stream.get("index"),
+            "Type": kind,
+            "Language": stream.get("language") or None,
+            "Codec": codec,
+            "Profile": profile,
+            "Channels": stream.get("channels"),
+            "Title": stream.get("name") or None,
+            "IsForced": bool(stream.get("isforced")),
+        }
+
+    @classmethod
+    def _native_current_tracks(cls, props):
+        """[audio description, subtitle description or "off"] playing in Kodi now."""
+        audio = props.get("currentaudiostream") or None
+        subtitle = props.get("currentsubtitle") or None
+        audio_desc = None
+        if audio:
+            converted = cls._from_kodi(audio, "Audio")
+            audio_desc = playutils.describe_stream([converted], converted["Index"])
+        if not props.get("subtitleenabled") or not subtitle:
+            return [audio_desc, "off"]
+        converted = cls._from_kodi(subtitle, "Subtitle")
+        return [audio_desc, playutils.describe_stream([converted], converted["Index"])]
+
+    def apply_native_tracks(self, item):
+        """Native mode: Kodi plays the file itself, so apply the series memory and
+        the lossless pick by matching Kodi's own stream list."""
+        remember = settings("rememberSeriesTracks.bool")
+        lossless = settings("preferLosslessAudio.bool")
+        if not remember and not lossless:
+            return
+        try:
+            props = self._kodi_streams()
+            audios = [
+                self._from_kodi(s, "Audio") for s in props.get("audiostreams") or []
+            ]
+            subs = [
+                self._from_kodi(s, "Subtitle") for s in props.get("subtitles") or []
+            ]
+
+            entry = None
+            if remember:
+                item["TrackMemoryKey"] = self._native_memory_key(item)
+                if item["TrackMemoryKey"]:
+                    entry = playutils.recall_tracks(
+                        playutils.load_track_memory(),
+                        item["TrackMemoryKey"],
+                        playutils.time.time(),
+                    )
+
+            audio = subtitle = None
+            if entry:
+                audio, subtitle = playutils.apply_track_memory(entry, audios + subs)
+
+            current = (props.get("currentaudiostream") or {}).get("index")
+            if audio is None and lossless and current is not None:
+                picked = playutils.pick_audio_stream(
+                    audios, current, playutils.kodi_lossless_passthrough()
+                )
+                if picked != current:
+                    audio = picked
+
+            if audio is not None and audio != current:
+                self.setAudioStream(audio)
+            if subtitle == -1:
+                self.showSubtitles(False)
+            elif subtitle is not None:
+                self.setSubtitleStream(subtitle)
+                self.showSubtitles(True)
+
+            LOG.info("Native tracks: audio %s, subtitle %s", audio, subtitle)
+            if item.get("TrackMemoryKey"):
+                changed = audio is not None or subtitle is not None
+                applied = self._kodi_streams() if changed else props
+                item["NativeStart"] = self._native_current_tracks(applied)
+                item["NativeTracks"] = item["NativeStart"]
+        except Exception as error:
+            LOG.warning("Native track choice failed: %s", error)
+
+    @staticmethod
+    def _native_memory_key(item):
+        """Same key as add-on mode (user/series), so both modes share the memory."""
+        if item.get("Type") != "Episode":
+            return None
+        server = item["Server"]
+        series_id = (server.jellyfin.get_item(item["Id"]) or {}).get("SeriesId")
+        user_id = server.config.data.get("auth.user_id") or ""
+        return "%s/%s" % (user_id, series_id) if series_id else None
+
+    @staticmethod
+    def _remember_series_tracks(item):
+        """Save the audio/subtitles of an episode for its series when they were
+        changed during playback; an unchanged pick leaves the memory alone."""
+        key = item.get("TrackMemoryKey")
+        if not key or not settings("rememberSeriesTracks.bool"):
+            return
+
+        if item.get("PlayOption") == "Native":
+            start, now = item.get("NativeStart"), item.get("NativeTracks")
+            if not start or not now or now == start:
+                return
+            Player._save_series_tracks(key, now[0], now[1])
+            return
+
+        def subs(index):
+            return None if index in (None, -1) else index
+
+        audio = item.get("AudioStreamIndex")
+        subtitle = subs(item.get("SubtitleStreamIndex"))
+        if audio == item.get("StartAudioStreamIndex") and subtitle == subs(
+            item.get("StartSubtitleStreamIndex")
+        ):
+            return
+
+        streams = item.get("TrackStreams") or []
+        audio_desc = playutils.describe_stream(streams, audio)
+        subtitle_desc = (
+            "off" if subtitle is None else playutils.describe_stream(streams, subtitle)
+        )
+        if audio_desc is None and subtitle_desc is None:
+            return
+        Player._save_series_tracks(key, audio_desc, subtitle_desc)
+
+    @staticmethod
+    def _save_series_tracks(key, audio_desc, subtitle_desc):
+        try:
+            memory = playutils.load_track_memory()
+            playutils.remember_tracks(
+                memory, key, audio_desc, subtitle_desc, playutils.time.time()
+            )
+            playutils.save_track_memory(memory)
+            LOG.info(
+                "Remembered tracks for %s: %s / %s", key, audio_desc, subtitle_desc
+            )
+        except Exception as error:
+            LOG.warning("Could not remember tracks: %s", error)
+
+    def track_position(self):
+        """Remember where playback is, once a second, so the stop report
+        sends the position on screen instead of the last progress poll."""
+        try:
+            current_file = self.get_playing_file()
+            if not self.is_playing_file(current_file):
+                return
+            self.get_file_info(current_file)["LivePosition"] = float(self.getTime())
+        except Exception as error:
+            LOG.debug("track_position: %s", error)
+
     def onPlayBackStopped(self):
         """Will be called when user stops playing a file."""
         window("jellyfin_play", clear=True)
@@ -448,6 +673,7 @@ class Player(xbmc.Player):
         if not self.played:
             return
 
+        segments_by_item = dict(self.skip_segments)
         self._reset_state()
 
         LOG.info("Played info: %s", self.played)
@@ -457,11 +683,25 @@ class Player(xbmc.Player):
 
             window("jellyfin.skip.%s.bool" % item["Id"], True)
 
+            self._remember_series_tracks(item)
+
+            live_position = item.pop("LivePosition", None)
+            if live_position is not None:
+                item["CurrentPosition"] = live_position
+
             if window("jellyfin.external.bool"):
                 window("jellyfin.external", clear=True)
 
                 if int(item["CurrentPosition"]) == 1:
-                    item["CurrentPosition"] = int(item["Runtime"])
+                    item["CurrentPosition"] = self._runtime_seconds(item)
+
+            if item.get("FinishPosition"):
+                item["CurrentPosition"] = item.pop("FinishPosition")
+            elif self._stopped_in_end_credits(
+                item, segments_by_item.get(item["Id"]), item["CurrentPosition"]
+            ):
+                LOG.info("Stopped in the end credits: reporting the item as finished")
+                item["CurrentPosition"] = self._runtime_seconds(item)
 
             data = {
                 "ItemId": item["Id"],
@@ -495,7 +735,9 @@ class Player(xbmc.Player):
                     if item["Id"] in file:
                         xbmcvfs.delete(os.path.join(path, file))
 
-            result = item["Server"].jellyfin.get_item(item["Id"]) or {}
+            result = {}
+            if settings("offerDelete.bool"):
+                result = item["Server"].jellyfin.get_item(item["Id"]) or {}
 
             if "UserData" in result and result["UserData"]["Played"]:
                 delete = False
@@ -520,6 +762,41 @@ class Player(xbmc.Player):
 
         self.played.clear()
         window("jellyfin_playing_id", clear=True)
+
+    @staticmethod
+    def _runtime_seconds(item):
+        """Runtime in seconds: item["Runtime"] holds RunTimeTicks from the server,
+        or seconds when set_item filled it from Kodi."""
+        try:
+            runtime = float(item.get("Runtime") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if runtime > 1e6:
+            runtime /= 10000000.0
+        return runtime
+
+    @classmethod
+    def _stopped_in_end_credits(cls, item, segments, position):
+        """True when playback stopped inside a Credits segment that runs to the
+        end of the file, so the stop should count the item as watched."""
+        runtime = cls._runtime_seconds(item)
+        try:
+            position = float(position)
+        except (TypeError, ValueError):
+            return False
+        if runtime <= 0 or not segments:
+            return False
+
+        for segment in segments.values():
+            if segment.get("Type") != "Credits":
+                continue
+            start = segment.get("Start")
+            end = segment.get("End")
+            if start is None or end is None or end <= start:
+                continue
+            if end >= runtime - END_OF_FILE_WINDOW and start <= position:
+                return True
+        return False
 
     def _fetch_skip_segments(self, item):
         if not settings("mediaSegmentsEnabled.bool"):
@@ -647,6 +924,11 @@ class Player(xbmc.Player):
             if current_file and self.is_playing_file(current_file):
                 item = self.get_file_info(current_file)
                 runtime = float(item.get("Runtime") or 0)
+                # Runtime holds RunTimeTicks from the server (playutils), or seconds when
+                # set_item had to fill it from Kodi. Ticks for anything over 0.1 s exceed 1e6;
+                # seconds stay far below that (1e6 s = 11 days).
+                if runtime > 1e6:
+                    runtime /= 10000000.0
                 if runtime > 0:
                     return runtime
         except Exception:
@@ -676,7 +958,48 @@ class Player(xbmc.Player):
 
         return safe_seek_time
 
+    def _segment_reaches_end(self, end):
+        runtime = self._get_runtime_for_seek()
+        return runtime > 0 and end >= runtime - END_OF_FILE_WINDOW
+
+    def _finish_current_item(self, segment_type):
+        """Skip to the end without seeking near EOF: play the next playlist entry,
+        or stop with the stop position reported at the end so the item counts as played.
+        """
+        runtime = self._get_runtime_for_seek()
+        try:
+            current_file = self.get_playing_file()
+            if runtime > 0 and self.is_playing_file(current_file):
+                self.get_file_info(current_file)["FinishPosition"] = runtime
+        except Exception as error:
+            LOG.debug("_finish_current_item: no playing item: %s", error)
+
+        playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
+        if 0 <= playlist.getposition() < playlist.size() - 1:
+            LOG.info("Skipped %s to the end: next playlist item", segment_type)
+            self.playnext()
+        else:
+            LOG.info("Skipped %s to the end: stopping", segment_type)
+            self.stop()
+
     def _handle_skip_segment(self, segment_type, start, end, mode):
+        if self._segment_reaches_end(end):
+            try:
+                if float(self.getTime()) >= end:
+                    return
+            except Exception:
+                pass
+
+            if mode == 1:  # Auto skip
+                self._finish_current_item(segment_type)
+            elif mode == 2:  # Show skip button
+                runtime = self._get_runtime_for_seek()
+                self._skip_to_end = True
+                self._show_skip_button(
+                    segment_type, max(0.0, end - start), runtime - END_OF_FILE_WINDOW
+                )
+            return
+
         safe_end = self._get_safe_seek_time(end)
         if safe_end is None or safe_end <= start:
             return
@@ -704,6 +1027,7 @@ class Player(xbmc.Player):
             )
 
         elif mode == 2:  # Show skip button
+            self._skip_to_end = False
             self._show_skip_button(segment_type, safe_end - start, safe_end)
 
     def _show_skip_button(self, segment_type, duration, end_time):
@@ -747,6 +1071,10 @@ class Player(xbmc.Player):
         while self.skip_dialog and not monitor.abortRequested():
             # Check if user clicked skip
             if self.skip_dialog.is_skip():
+                if self._skip_to_end:
+                    self._reset_skip_dialog()
+                    self._finish_current_item("segment")
+                    break
                 self.seekTime(self._skip_end_time)
                 LOG.info("User skipped to %.1f", self._skip_end_time)
                 break
@@ -773,6 +1101,7 @@ class Player(xbmc.Player):
 
         LOG.debug("_monitor_skip_dialog: exiting loop")
         self._reset_skip_dialog()
+        self._skip_to_end = False
 
     def _reset_state(self, restart=False):
         self._reset_segment_checker(restart)

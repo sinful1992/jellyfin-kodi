@@ -7,12 +7,14 @@ import sys
 
 import xbmc
 import xbmcaddon
+import xbmcgui
 import xbmcvfs
 
 from .. import database
 from ..dialogs import context
 from ..helper import translate, settings, dialog, LazyLogger
 from ..jellyfin import Jellyfin
+from . import playseries
 
 #################################################################################################
 
@@ -29,6 +31,7 @@ OPTIONS = {
     "AddFav": translate(30405),
     "RemoveFav": translate(30406),
     "Transcode": translate(30412),
+    "PlaySeries": translate(30704),
 }
 
 #################################################################################################
@@ -134,6 +137,9 @@ class Context(object):
         """
         options = []
 
+        if self.item["Type"] in ("Series", "Season"):
+            options.append(OPTIONS["PlaySeries"])
+
         if self.item["Type"] != "Season":
 
             if self.item["UserData"].get("IsFavorite"):
@@ -175,6 +181,53 @@ class Context(object):
 
         elif selected == OPTIONS["Delete"]:
             self.delete_item()
+
+        elif selected == OPTIONS["PlaySeries"]:
+            self.play_series()
+
+    def play_series(self):
+        """Start the series at the right episode, also for a rewatch."""
+        series_id = self.item["Id"]
+        if self.item["Type"] == "Season":
+            series_id = self.item.get("SeriesId") or self.api_client.get_item(
+                self.item["Id"]
+            ).get("SeriesId")
+        if not series_id:
+            return
+
+        next_up = self.api_client.shows(
+            "/NextUp", {"SeriesId": series_id, "UserId": "{UserId}", "Limit": 1}
+        )
+        episodes = self.api_client.shows(
+            "/%s/Episodes" % series_id, {"UserId": "{UserId}"}
+        )
+        episode, resume = playseries.pick_series_episode(
+            (next_up or {}).get("Items"), (episodes or {}).get("Items")
+        )
+        if not episode:
+            LOG.info("Play series: no episodes for %s", series_id)
+            return
+
+        queue = playseries.series_queue((episodes or {}).get("Items"), episode)
+        LOG.info(
+            "Play series %s: %s (resume %s), %s queued",
+            series_id,
+            episode["Id"],
+            resume,
+            len(queue),
+        )
+        playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
+        playlist.clear()
+        for position, queued in enumerate(queue):
+            listitem = xbmcgui.ListItem(queued.get("Name") or "")
+            listitem.setProperty("IsPlayable", "true")
+            playlist.add(
+                playseries.play_url(
+                    queued["Id"], self.server_id, resume if position == 0 else None
+                ),
+                listitem,
+            )
+        xbmc.Player().play(playlist)
 
     def delete_item(self):
         if settings("skipContextMenu.bool") or dialog(

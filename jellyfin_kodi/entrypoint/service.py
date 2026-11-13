@@ -114,6 +114,7 @@ class Service(xbmc.Monitor):
                 if player.isPlaying() and player.is_playing_file(
                     player.get_playing_file()
                 ):
+                    player.track_position()
                     difference = datetime.today() - self.settings["last_progress"]
 
                     if difference.seconds > 10:
@@ -167,6 +168,23 @@ class Service(xbmc.Monitor):
             self.library_thread.stop_client()
             self.library_thread = None
 
+    _screensaver_lock = threading.Lock()
+
+    def _screensaver_sync(self):
+        """Quick sync a few seconds after the screensaver ends (network wake-up).
+        A second screensaver end while one sync waits or runs is dropped."""
+        if not self._screensaver_lock.acquire(False):
+            return
+        try:
+            if self.waitForAbort(5):
+                return
+            if self.library_thread is not None:
+                self.library_thread.fast_sync()
+        except Exception as error:
+            LOG.exception("Screensaver quick sync failed: %s", error)
+        finally:
+            self._screensaver_lock.release()
+
     def onNotification(self, sender, method, data):
         """All notifications are sent via NotifyAll built-in or Kodi.
         Central hub.
@@ -202,7 +220,12 @@ class Service(xbmc.Monitor):
 
             data = json.loads(data)[0]
         else:
-            if method not in ("System.OnQuit", "System.OnSleep", "System.OnWake"):
+            if method not in (
+                "System.OnQuit",
+                "System.OnSleep",
+                "System.OnWake",
+                "GUI.OnScreensaverDeactivated",
+            ):
                 return
 
             data = json.loads(data)
@@ -409,10 +432,9 @@ class Service(xbmc.Monitor):
         elif method == "GUI.OnScreensaverDeactivated":
 
             LOG.info("--<[ screensaver ]")
-            xbmc.sleep(5000)
-
-            if self.library_thread is not None:
-                self.library_thread.fast_sync()
+            # Kodi runs an add-on's callbacks one after another, so waiting here
+            # would hold a Play pressed right after waking by 5 s.
+            threading.Thread(target=self._screensaver_sync, daemon=True).start()
 
         elif method == "UserConfigurationUpdated" and data.get("ServerId") is None:
             Views().get_views()

@@ -134,12 +134,8 @@ class Library(threading.Thread):
                 xbmc.executebuiltin("UpdateLibrary(video)")
                 xbmc.executebuiltin("ReloadSkin()")
 
-    @stop
-    def service(self):
-        """If error is encountered, it will rerun this function.
-        Start new "daemon threads" to process library updates.
-        (actual daemon thread is not supported in Kodi)
-        """
+    def _prune_threads(self):
+        """Forget finished workers so new ones can start (sort and notify were never pruned)."""
         self.download_threads = [
             thread for thread in self.download_threads if not thread.is_done
         ]
@@ -152,6 +148,20 @@ class Library(threading.Thread):
         self.writer_threads["removed"] = [
             thread for thread in self.writer_threads["removed"] if not thread.is_done
         ]
+        self.jellyfin_threads = [
+            thread for thread in self.jellyfin_threads if not thread.is_done
+        ]
+        self.notify_threads = [
+            thread for thread in self.notify_threads if not thread.is_done
+        ]
+
+    @stop
+    def service(self):
+        """If error is encountered, it will rerun this function.
+        Start new "daemon threads" to process library updates.
+        (actual daemon thread is not supported in Kodi)
+        """
+        self._prune_threads()
 
         if (
             not self.player.isPlayingVideo()
@@ -294,6 +304,7 @@ class Library(threading.Thread):
             new_thread = SortWorker(self.removed_queue, self.removed_output)
             new_thread.start()
             LOG.info("-->[ q:sort/%s ]", id(new_thread))
+            self.jellyfin_threads.append(new_thread)
 
     def worker_updates(self):
         """Update items in the Kodi database."""

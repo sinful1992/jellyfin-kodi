@@ -1,0 +1,28 @@
+# Changelog
+
+Changes in our copy (sinful1992/jellyfin-kodi) on top of upstream jellyfin-kodi `bb32e3b5`.
+Upstream's own release notes stay in `release.yaml`.
+
+## Unreleased (dev)
+
+### Fixed
+- Credits auto-skip / Skip button no longer seeks to 1 s before the end of the file, which froze playback (upstream #1227); the item is finished instead: next playlist entry, or stop reported at the end (linus, cb6cb80).
+- The stop report sends the position on screen, not the last ~11 s progress poll (K3, ada, 4f4dd75).
+- External player: the stop report sent the runtime in ticks as seconds (1e7 times too far); now seconds, and a Runtime filled from Kodi in seconds is understood too (ada).
+- Playback start: the audio/subtitles the add-on chose are applied 2 s in even when Kodi already reported its own first tracks (they used to overwrite the choice), and an intro at 0:00 no longer holds the start until it ends; the segment checker thread shows its Skip button instead (K11, ada).
+- Subtitles: the Jellyfin subtitle index is mapped to Kodi's list with an explicit table of the subtitles inside the file, so a cover-image stream or extra streams no longer shift the choice by one (K13, ada). Order of downloaded subtitles vs embedded ones is unchanged (still to be checked on a real Kodi).
+- Small fixes (ada, Fable K9/K15): ending the screensaver runs the quick sync again (the notification was filtered out), in its own thread so a Play pressed right after waking is not held 5 s; "Max days in next episodes" = 0 now means no limit (a string was compared with 0); Stop no longer fetches the item from the server unless "offer delete" is on; Up Next no longer offers a random episode when the current one is missing from the server's list.
+- Stop pressed inside end credits that run to the end of the file counts the episode as watched (K8, ada, a708e68).
+- A request retried after a connection error, read timeout or 502 went out as a GET: the method was popped inside the retry loop, so a retried POST/DELETE (stop report, progress, mark played) changed method. Read once now (K7, linus). Tests: tests/test_http_retry.py (8, 5 fail on bb32e3b5).
+- Tests for the credits-skip fix: tests/test_skip_end_of_file.py (16, 10 fail on bb32e3b5), incl. the Runtime ticks/seconds fallback (linus).
+- Native mode path replacement (upstream #1041): a rule matched anywhere in the path and every rule ran in turn, so `/data/movies` → share 1 also rewrote `/data/movies2/Alice.mkv` into share 1 (`.../media/movies2/...`, a path that doesn't exist). Now the longest prefix that ends at a path boundary wins, once; trailing slashes in the settings don't matter; a URL target uses `/` (linus). Tests: tests/test_path_replace.py (22; the module had no such function before).
+- Incremental sync asked the server for an item's ancestors once or twice per episode/movie (`find_library`, ~57 ms each on our server), holding Kodi's video DB transaction meanwhile: a library-wide refresh of our 4088 episodes cost 4-8 min of extra calls. Now one call per series/folder, cached per library whitelist; a 500 (None) answer no longer raises (K5, upstream #848, linus). Tests: tests/test_find_library_cache.py (9, 4 fail on bb32e3b5). Full sync was already fine: 2:34 for 4088 episodes + 162 movies.
+- Library service: finished sort and notify workers were never forgotten, so a new sort worker started every 2 s while removals waited and "new content" notifications stopped after the first batch; workers are pruned and capped now. Views: a missing comma (`"type" "inprogress.content"`) and a hard-coded `Jellyfin.nodes` prefix meant `.type` and every `Jellyfin.wnodes.*` property were never cleared (K15, linus). Tests: tests/test_library_workers.py (6, all fail on bb32e3b5).
+- Full sync paging: an empty page (items removed after the count) or a 500 answer read `result["Items"][0]` and raised; with a page in the middle the sync did not just stop, it hung for good (the thread pool waited on a semaphore that was never released). Empty pages are skipped, the semaphore is always released, and the #216 year fix runs on every item instead of only the first (K15, linus). Tests: tests/test_downloader_pages.py (4; on bb32e3b5 3 fail and the 500-page case hangs).
+- Tests: the path-replacement fixture uses made-up NAS names (nas.example) instead of a real home network (linus).
+
+### Added
+- Per-series audio/subtitle memory (K2, ada): change audio or subtitles in an episode and the next episodes of that series start with the same choice, matched by language, title, forced flag and codec; per Jellyfin user, kept 60 days, "subtitles off" remembered too. Kodi switches are caught as they happen (onAVChange). Add-on mode, direct play/stream; setting "Remember audio and subtitles per series" (on).
+- "Play series" in the Jellyfin options menu of a show or season (K6, ada): queues the rest of the series in Kodi's video playlist and starts at the right episode: the most recent unfinished episode (only when nothing was watched after it), else the server's Next Up, else the episode after the most recently played one (rewatch), else the first unplayed, else S01E01; specials skipped.
+- Native mode (Kodi plays the NAS file itself): the series audio/subtitle memory and the lossless pick also apply, by matching Kodi's own stream list; both modes share one memory (ada, linus #11195).
+- Setting "Prefer lossless audio (TrueHD, DTS-HD MA)", on by default: picks a TrueHD / DTS-HD MA track in the default track's language instead of a lossy default, only for formats whose passthrough is on in Kodi's audio settings (K4, ada, f11bf229).

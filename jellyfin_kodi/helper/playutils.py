@@ -2,7 +2,9 @@
 
 #################################################################################################
 
+import json
 import os
+import time
 from uuid import uuid4
 
 import requests
@@ -29,6 +31,185 @@ class Transcode(object):
 #################################################################################################
 
 
+PASSTHROUGH_SETTINGS = {
+    "truehd": "audiooutput.truehdpassthrough",
+    "dtshd": "audiooutput.dtshdpassthrough",
+}
+
+
+def _lossless_kind(stream):
+    """'truehd' or 'dtshd' for a track a receiver can take whole, else None."""
+    codec = (stream.get("Codec") or "").lower()
+    profile = (stream.get("Profile") or "").upper()
+    if codec == "truehd":
+        return "truehd"
+    if codec == "dts" and ("MA" in profile or "DTS:X" in profile):
+        return "dtshd"
+    return None
+
+
+def kodi_lossless_passthrough():
+    """The lossless formats Kodi passes through to the receiver right now,
+    read from Kodi's audio settings. Empty when passthrough is off: then a
+    lossless track would be decoded to PCM, which an ARC TV turns into stereo."""
+    from . import JSONRPC
+
+    def setting(name):
+        try:
+            result = JSONRPC("Settings.GetSettingValue").execute({"setting": name})
+            return bool(result["result"]["value"])
+        except Exception:
+            return False
+
+    if not setting("audiooutput.passthrough"):
+        return set()
+    return {kind for kind, name in PASSTHROUGH_SETTINGS.items() if setting(name)}
+
+
+def pick_audio_stream(media_streams, default_index, passthrough=("truehd", "dtshd")):
+    """Return the index of the best lossless track in the default track's language.
+
+    Moves off the server default only to a TrueHD or DTS-HD MA/X track whose
+    passthrough is on (``passthrough``), and only when the default is not already
+    such a track; more channels win between candidates; commentary tracks are
+    never chosen. Returns default_index otherwise.
+    """
+    audio = [s for s in media_streams or [] if s.get("Type") == "Audio"]
+    default = next((s for s in audio if s.get("Index") == default_index), None)
+    if default is None or _lossless_kind(default) in passthrough:
+        return default_index
+
+    def is_commentary(stream):
+        return "comment" in (stream.get("Title") or "").lower()
+
+    candidates = [
+        s
+        for s in audio
+        if s.get("Language") == default.get("Language")
+        and not is_commentary(s)
+        and _lossless_kind(s) in passthrough
+    ]
+    if not candidates:
+        return default_index
+    return max(candidates, key=lambda s: s.get("Channels") or 0)["Index"]
+
+
+TRACK_MEMORY_DAYS = 60
+TRACK_MEMORY_FILE = (
+    "special://profile/addon_data/plugin.video.jellyfin/track_memory.json"
+)
+_STREAM_FIELDS = ("Index", "Type", "Language", "Codec", "Channels", "Title", "IsForced")
+
+
+def embedded_subtitle_indexes(media_streams):
+    """Jellyfin indexes of the subtitles inside the file, in the order Kodi's
+    demuxer lists them (container order). Sidecar files are not in the file."""
+    return [
+        stream["Index"]
+        for stream in sorted(media_streams or [], key=lambda s: s.get("Index", 0))
+        if stream.get("Type") == "Subtitle" and not stream.get("IsExternal")
+    ]
+
+
+def compact_streams(media_streams):
+    """The audio and subtitle streams of a source, with only what matching needs."""
+    return [
+        {key: stream.get(key) for key in _STREAM_FIELDS}
+        for stream in media_streams or []
+        if stream.get("Type") in ("Audio", "Subtitle")
+    ]
+
+
+def describe_stream(streams, index):
+    """What to remember about the stream with this index (None if not found)."""
+    for stream in streams or []:
+        if stream.get("Index") == index:
+            return {
+                key: stream.get(key)
+                for key in ("Language", "Codec", "Channels", "Title", "IsForced")
+            }
+    return None
+
+
+def match_stream(streams, wanted, kind):
+    """Index of the stream of this kind that best fits a remembered description.
+
+    The language must match; title, forced flag, codec and channels break ties.
+    Returns None when no stream of that language exists.
+    """
+    if not wanted:
+        return None
+    best, best_score = None, -1
+    for stream in streams or []:
+        if stream.get("Type") != kind or stream.get("Language") != wanted.get(
+            "Language"
+        ):
+            continue
+        score = 0
+        if wanted.get("Title") and stream.get("Title") == wanted.get("Title"):
+            score += 8
+        if bool(stream.get("IsForced")) == bool(wanted.get("IsForced")):
+            score += 4
+        if (stream.get("Codec") or "").lower() == (wanted.get("Codec") or "").lower():
+            score += 2
+        if stream.get("Channels") == wanted.get("Channels"):
+            score += 1
+        if score > best_score:
+            best, best_score = stream, score
+    return best["Index"] if best else None
+
+
+def load_track_memory(path=None):
+    try:
+        with open(path or xbmcvfs.translatePath(TRACK_MEMORY_FILE), "r") as infile:
+            data = json.load(infile)
+        return data if isinstance(data, dict) else {}
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def save_track_memory(memory, path=None):
+    path = path or xbmcvfs.translatePath(TRACK_MEMORY_FILE)
+    try:
+        folder = os.path.dirname(path)
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder)
+        temp = path + ".tmp"
+        with open(temp, "w") as outfile:
+            json.dump(memory, outfile)
+        os.replace(temp, path)
+    except (IOError, OSError) as error:
+        LOG.warning("Could not save track memory: %s", error)
+
+
+def _expired(entry, now):
+    return now - entry.get("Saved", 0) > TRACK_MEMORY_DAYS * 86400
+
+
+def remember_tracks(memory, key, audio, subtitle, now):
+    """Store the pick for a series. subtitle is a description, or "off"."""
+    for old_key in [k for k, v in memory.items() if _expired(v, now)]:
+        del memory[old_key]
+    memory[key] = {"Audio": audio, "Subtitle": subtitle, "Saved": now}
+    return memory
+
+
+def recall_tracks(memory, key, now):
+    entry = memory.get(key)
+    if not entry or _expired(entry, now):
+        return None
+    return entry
+
+
+def apply_track_memory(entry, streams):
+    """(audio index or None, subtitle index or -1 for off or None) from a memory entry."""
+    audio = match_stream(streams, entry.get("Audio"), "Audio")
+    subtitle = entry.get("Subtitle")
+    if subtitle == "off":
+        return audio, -1
+    return audio, match_stream(streams, subtitle, "Subtitle")
+
+
 def set_properties(item, method, server_id=None):
     """Set all properties for playback detection."""
     info = item.get("PlaybackInfo") or {}
@@ -52,6 +233,11 @@ def set_properties(item, method, server_id=None):
             "SubtitleStreamIndex": info.get("SubtitleStreamIndex"),
             "CurrentPosition": info.get("CurrentPosition"),
             "CurrentEpisode": info.get("CurrentEpisode"),
+            "KodiEmbeddedSubtitleIndexes": info.get("KodiEmbeddedSubtitleIndexes"),
+            "TrackMemoryKey": info.get("TrackMemoryKey"),
+            "TrackStreams": info.get("TrackStreams"),
+            "StartAudioStreamIndex": info.get("AudioStreamIndex"),
+            "StartSubtitleStreamIndex": info.get("SubtitleStreamIndex"),
         }
     )
 
@@ -220,6 +406,30 @@ class PlayUtils(object):
             LOG.info("--[ transcode ]")
             self.transcode(source, audio, subtitle)
 
+        if (
+            audio is None
+            and subtitle is None
+            and self.info.get("Method") != "Transcode"
+        ):
+            self.apply_series_track_memory(source)
+
+        if (
+            audio is None
+            and self.info.get("AudioStreamIndex") is None
+            and self.info.get("Method") != "Transcode"
+            and settings("preferLosslessAudio.bool")
+        ):
+            self.info["AudioStreamIndex"] = pick_audio_stream(
+                source.get("MediaStreams"),
+                source.get("DefaultAudioStreamIndex"),
+                kodi_lossless_passthrough(),
+            )
+
+        if self.info.get("Method") != "Transcode":
+            self.info["KodiEmbeddedSubtitleIndexes"] = embedded_subtitle_indexes(
+                source.get("MediaStreams")
+            )
+
         self.info["AudioStreamIndex"] = self.info.get("AudioStreamIndex") or source.get(
             "DefaultAudioStreamIndex"
         )
@@ -230,6 +440,30 @@ class PlayUtils(object):
 
         API = api.API(self.item, self.info["ServerAddress"])
         window("jellyfinfilename", value=API.get_file_path(source.get("Path")))
+
+    def apply_series_track_memory(self, source):
+        """Start an episode with the audio/subtitles last picked for its series."""
+        series_id = self.item.get("SeriesId")
+        if not series_id or not settings("rememberSeriesTracks.bool"):
+            return
+
+        user_id = self.api_client.config.data.get("auth.user_id") or ""
+        streams = compact_streams(source.get("MediaStreams"))
+        self.info["TrackMemoryKey"] = "%s/%s" % (user_id, series_id)
+        self.info["TrackStreams"] = streams
+
+        entry = recall_tracks(
+            load_track_memory(), self.info["TrackMemoryKey"], time.time()
+        )
+        if not entry:
+            return
+
+        audio, subtitle = apply_track_memory(entry, streams)
+        LOG.info("Series track memory: audio %s, subtitle %s", audio, subtitle)
+        if audio is not None:
+            self.info["AudioStreamIndex"] = audio
+        if subtitle is not None:
+            self.info["SubtitleStreamIndex"] = subtitle
 
     def live_stream(self, source):
         """Get live stream media info."""

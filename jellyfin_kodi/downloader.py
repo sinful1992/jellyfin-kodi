@@ -270,25 +270,34 @@ def _get_items(query, server_id=None):
                 del jobs[job]
                 del job
 
-                # Mitigates #216 till the server validates the date provided is valid
-                if result["Items"][0].get("ProductionYear"):
-                    try:
-                        date(result["Items"][0]["ProductionYear"], 1, 1)
-                    except ValueError:
-                        LOG.info(
-                            "#216 mitigation triggered. Setting ProductionYear to None"
-                        )
-                        result["Items"][0]["ProductionYear"] = None
+                try:
+                    # Mitigates #216 till the server validates the date provided is valid.
+                    # Every item, not only the first; an empty page (items removed since the
+                    # count, or a 500 answered with None) used to raise IndexError and end
+                    # the whole full sync.
+                    for item in result.get("Items") or []:
+                        _fix_production_year(item)
 
-                items["Items"].extend(result["Items"])
-                # Using items to return data and communicate a restore point back to the callee is
-                # a violation of the SRP. TODO: Separate responsibilities.
-                items["RestorePoint"] = query
-                yield items
-                del items["Items"][:]
+                    items["Items"].extend(result.get("Items") or [])
+                    # Using items to return data and communicate a restore point back to the callee
+                    # is a violation of the SRP. TODO: Separate responsibilities.
+                    items["RestorePoint"] = query
+                    yield items
+                    del items["Items"][:]
+                finally:
+                    # release the semaphore again, also when the consumer stops early
+                    thread_buffer.release()
 
-                # release the semaphore again
-                thread_buffer.release()
+
+def _fix_production_year(item):
+    year = item.get("ProductionYear")
+    if not year:
+        return
+    try:
+        date(year, 1, 1)
+    except (TypeError, ValueError):
+        LOG.info("#216 mitigation triggered. Setting ProductionYear to None")
+        item["ProductionYear"] = None
 
 
 class GetItemWorker(threading.Thread):

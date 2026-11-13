@@ -564,14 +564,38 @@ def get_filesystem_encoding():
     return enc
 
 
+# find_library cache (K5, upstream #848): episodes of one series and movies of one folder share
+# a library, so one Ancestors call (~57 ms on our server) per series/folder is enough instead of
+# one or two per item. Keyed by the whitelist too, so adding or removing a library starts afresh.
+_LIBRARY_CACHE = {}
+_LIBRARY_CACHE_MAX = 5000
+
+
+def _library_cache_key(item):
+    for field in ("SeriesId", "ParentId"):
+        if item.get(field):
+            return "%s:%s" % (field, item[field])
+    return None
+
+
 def find_library(server, item):
     from ..database import get_sync
 
     sync = get_sync()
-    whitelist = [x.replace("Mixed:", "") for x in sync["Whitelist"]]
+    whitelist = tuple(sorted(x.replace("Mixed:", "") for x in sync["Whitelist"]))
+    key = _library_cache_key(item)
+    if key is not None:
+        cached = _LIBRARY_CACHE.get((whitelist, key))
+        if cached:
+            return cached
+
     ancestors = server.jellyfin.get_ancestors(item["Id"])
-    for ancestor in ancestors:
+    for ancestor in ancestors or []:
         if ancestor["Id"] in whitelist:
+            if key is not None:
+                if len(_LIBRARY_CACHE) >= _LIBRARY_CACHE_MAX:
+                    _LIBRARY_CACHE.clear()
+                _LIBRARY_CACHE[(whitelist, key)] = ancestor
             return ancestor
 
     LOG.error("No ancestor found, not syncing item with ID: {}".format(item["Id"]))

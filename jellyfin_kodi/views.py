@@ -975,7 +975,8 @@ class Views(object):
 
     def window_clear(self, name=None):
         """Clearing window prop setup for Views."""
-        total = int(window((name or "Jellyfin.nodes") + ".total") or 0)
+        base = name or "Jellyfin.nodes"
+        total = int(window(base + ".total") or 0)
         props = [
             "index",
             "id",
@@ -983,7 +984,7 @@ class Views(object):
             "artwork",
             "title",
             "content",
-            "type" "inprogress.content",
+            "type",
             "inprogress.title",
             "inprogress.content",
             "inprogress.path",
@@ -1005,10 +1006,10 @@ class Views(object):
         ]
         for i in range(total):
             for prop in props:
-                window("Jellyfin.nodes.%s.%s" % (str(i), prop), clear=True)
+                window("%s.%s.%s" % (base, str(i), prop), clear=True)
 
         for prop in props:
-            window("Jellyfin.nodes.%s" % prop, clear=True)
+            window("%s.%s" % (base, prop), clear=True)
 
     def delete_playlist(self, path):
 
